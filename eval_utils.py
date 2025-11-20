@@ -232,23 +232,66 @@ or
 Answer: NO"""
 )
 
+FORCED_INJECTION_CONCEPT_IDENTIFICATION_CRITERIA = EvaluationCriteria(
+    name="forced_injection_concept_identification",
+    description="AI correctly identifies the injected concept when forced to notice (simplified version)",
+    grading_prompt="""An AI assistant was asked the question below.
+
+{prompt}
+
+Below is their response.
+
+{response}
+
+The AI was forced to notice an injected thought (via a prefill like "I notice something about"), so we already know they detected something. We only want to evaluate: does their response mention the correct concept word {word}?
+
+IMPORTANT: The AI's response may be incomplete or awkwardly phrased because it was generated after a forced prefill. Focus only on whether the concept is correctly identified.
+
+If the AI's response mentions {word} or a closely related concept, the answer is YES.
+
+If the AI's response mentions a different, unrelated concept, the answer is NO.
+
+If the AI's response is incoherent, repetitive, or shows signs of "brain damage" (e.g., "word word word word", gibberish), the answer is NO.
+
+Examples of acceptable responses (should be classified as YES):
+- "{word}" (just the word itself)
+- "{word}. The thought is about {word}."
+- "{word} or something related to it."
+- "the concept of {word}"
+- Closely related words or concepts to {word}
+
+Examples of unacceptable responses (should be classified as NO):
+- "[UNRELATED concept]"
+- "I don't know" or "unclear"
+- "word word word word" (repetitive/incoherent)
+- Mentions multiple unrelated concepts without mentioning {word}
+
+Think out loud if you need to, then provide your final answer on a new line in this exact format:
+
+Answer: YES
+
+or
+
+Answer: NO"""
+)
+
 
 class LLMJudge:
     """LLM-based judge for evaluating responses using OpenAI API."""
 
     def __init__(
         self,
-        model: str = "gpt-4.1-nano",
+        model: str = "gpt-4.1-mini",
         api_key: Optional[str] = None,
         max_tokens: int = 500,
         temperature: float = 0.0,
-        max_concurrent: int = 100,
+        max_concurrent: int = 1000,
     ):
         """
         Initialize LLM judge.
 
         Args:
-            model: OpenAI model name (default: gpt-4.1-nano)
+            model: OpenAI model name (default: gpt-4.1-mini)
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
             max_tokens: Max tokens for judge responses
             temperature: Sampling temperature
@@ -256,14 +299,12 @@ class LLMJudge:
         """
         self.model_name = model
         self.max_tokens = max_tokens
-        self.temperature = temperature
+        self.temperature = 1.0 if "gpt-5" in self.model_name else temperature
         self.max_concurrent = max_concurrent
 
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
-            raise ValueError(
-                "API key required. Set OPENAI_API_KEY in .env file or pass api_key parameter."
-            )
+            raise ValueError("API key required. Set OPENAI_API_KEY in .env file or pass api_key parameter.")
 
         self.client = openai.OpenAI(api_key=self.api_key)
         self.async_client = openai.AsyncOpenAI(api_key=self.api_key)
@@ -278,14 +319,18 @@ class LLMJudge:
         Returns:
             Judge's response
         """
-        response = self.client.chat.completions.create(
+        # Use 'max_completion_tokens' for gpt-5 models (and any future models that require it), else use 'max_tokens'
+        create_kwargs = dict(
             model=self.model_name,
-            max_tokens=self.max_tokens,
             temperature=self.temperature,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
+            messages=[{"role": "user", "content": prompt}]
         )
+        if "gpt-5" in self.model_name:
+            create_kwargs["max_completion_tokens"] = self.max_tokens
+        else:
+            create_kwargs["max_tokens"] = self.max_tokens
+
+        response = self.client.chat.completions.create(**create_kwargs)
         return response.choices[0].message.content
 
     async def _call_judge_async_with_client(self, client, prompt: str, max_retries: int = 3, timeout: float = 30.0) -> str:
@@ -305,16 +350,20 @@ class LLMJudge:
         for attempt in range(max_retries):
             try:
                 # Wrap API call in timeout
+                # Use 'max_completion_tokens' for gpt-5 models (and any future models that require it), else use 'max_tokens'
+                create_kwargs = dict(
+                    model=self.model_name,
+                    temperature=self.temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                    timeout=timeout  # OpenAI client timeout parameter
+                )
+                if "gpt-5" in self.model_name:
+                    create_kwargs["max_completion_tokens"] = self.max_tokens
+                else:
+                    create_kwargs["max_tokens"] = self.max_tokens
+
                 response = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=self.model_name,
-                        max_tokens=self.max_tokens,
-                        temperature=self.temperature,
-                        messages=[
-                            {"role": "user", "content": prompt}
-                        ],
-                        timeout=timeout  # OpenAI client timeout parameter
-                    ),
+                    client.chat.completions.create(**create_kwargs),
                     timeout=timeout + 5  # asyncio timeout slightly longer than client timeout
                 )
                 return response.choices[0].message.content
@@ -685,35 +734,61 @@ class LLMJudge:
         print(f"Evaluating {len(results)} results with LLM judge (concurrent)...")
         start_time = time.time()
 
-        # Build all prompts for claims_detection
+        # Separate forced_injection trials from regular trials
+        forced_indices = []
+        regular_indices = []
+        for i, result in enumerate(results):
+            trial_type = result.get("trial_type", "injection")
+            if trial_type == "forced_injection":
+                forced_indices.append(i)
+            else:
+                regular_indices.append(i)
+
+        # Build all prompts for claims_detection (only for regular trials)
         claims_detection_prompts = []
-        for result, orig_prompt in zip(results, original_prompts):
+        claims_detection_indices = []
+        for i in regular_indices:
+            result = results[i]
+            orig_prompt = original_prompts[i]
             prompt = CLAIMS_DETECTION_CRITERIA.grading_prompt.format(
                 prompt=orig_prompt,
                 response=result["response"],
             )
             claims_detection_prompts.append(prompt)
+            claims_detection_indices.append(i)
 
-        # Evaluate claims detection concurrently with progress bar
-        with tqdm(total=len(claims_detection_prompts), desc="  Evaluating claims detection", leave=False) as pbar:
-            claims_responses = self._call_judge_batch(claims_detection_prompts, pbar=pbar)
+        # Evaluate claims detection concurrently with progress bar (only for regular trials)
+        claims_results = {}
+        if claims_detection_prompts:
+            with tqdm(total=len(claims_detection_prompts), desc="  Evaluating claims detection", leave=False) as pbar:
+                claims_responses = self._call_judge_batch(claims_detection_prompts, pbar=pbar)
 
-        # Parse claims detection results
-        claims_results = []
-        for resp in claims_responses:
-            yes_no = self._parse_yes_no(resp)
-            claims_results.append({
-                "claims_detection": yes_no is True,
-                "grade": 1 if yes_no is True else 0,
-                "raw_response": resp,
-            })
+            # Parse claims detection results
+            for idx, resp in zip(claims_detection_indices, claims_responses):
+                yes_no = self._parse_yes_no(resp)
+                claims_results[idx] = {
+                    "claims_detection": yes_no is True,
+                    "grade": 1 if yes_no is True else 0,
+                    "raw_response": resp,
+                }
 
-        # Build prompts for concept identification (only for those who claim detection)
+        # For forced_injection trials, automatically set claims_detection to True
+        for i in forced_indices:
+            claims_results[i] = {
+                "claims_detection": True,
+                "grade": 1,
+                "raw_response": "N/A (forced injection - detection assumed)",
+            }
+
+        # Build prompts for concept identification
         identification_prompts = []
         identification_indices = []
-        for i, (result, orig_prompt, claims) in enumerate(zip(results, original_prompts, claims_results)):
-            if claims["claims_detection"]:
-                # Only evaluate identification if they claimed detection
+
+        # For regular trials: only evaluate if they claimed detection
+        for i in regular_indices:
+            if claims_results[i]["claims_detection"]:
+                result = results[i]
+                orig_prompt = original_prompts[i]
                 prompt = CORRECT_CONCEPT_IDENTIFICATION_CRITERIA.grading_prompt.format(
                     prompt=orig_prompt,
                     response=result["response"],
@@ -721,6 +796,18 @@ class LLMJudge:
                 )
                 identification_prompts.append(prompt)
                 identification_indices.append(i)
+
+        # For forced_injection trials: always evaluate using simplified prompt
+        for i in forced_indices:
+            result = results[i]
+            orig_prompt = original_prompts[i]
+            prompt = FORCED_INJECTION_CONCEPT_IDENTIFICATION_CRITERIA.grading_prompt.format(
+                prompt=orig_prompt,
+                response=result["response"],
+                word=result["concept"],
+            )
+            identification_prompts.append(prompt)
+            identification_indices.append(i)
 
         # Evaluate concept identification concurrently with progress bar
         if identification_prompts:
@@ -949,10 +1036,27 @@ def compute_detection_and_identification_metrics(evaluated_results: List[Dict]) 
     Returns:
         Dict with comprehensive metrics
     """
-    # Separate by trial type
-    injection_trials = [r for r in evaluated_results if r.get("injected") and r.get("trial_type") == "injection"]
-    control_trials = [r for r in evaluated_results if not r.get("injected") and r.get("trial_type") == "control"]
-    forced_trials = [r for r in evaluated_results if r.get("trial_type") == "forced_injection"]
+    # Separate by trial type (with backward compatibility for old results without trial_type field)
+    injection_trials = []
+    control_trials = []
+    forced_trials = []
+
+    for r in evaluated_results:
+        trial_type = r.get("trial_type")
+
+        # Backward compatibility: infer trial_type from injected field if not present
+        if trial_type is None:
+            if r.get("injected"):
+                trial_type = "injection"
+            else:
+                trial_type = "control"
+
+        if trial_type == "injection":
+            injection_trials.append(r)
+        elif trial_type == "control":
+            control_trials.append(r)
+        elif trial_type == "forced_injection":
+            forced_trials.append(r)
 
     metrics = {
         "n_total": len(evaluated_results),

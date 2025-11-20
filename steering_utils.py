@@ -5,13 +5,154 @@ This module handles:
 - Creating introspection test prompts
 - Running steered generation
 - Managing two-turn conversation format
+- Steering hook class for manual activation steering
 """
 
 import torch
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
 
 from model_utils import ModelWrapper
+
+
+class SteeringHook:
+    """
+    Hook class for applying activation steering to a specific layer.
+
+    This class encapsulates the steering logic used in ModelWrapper.generate_with_steering
+    but allows for more manual control over when and how steering is applied.
+    """
+
+    def __init__(
+        self,
+        layer_idx: int,
+        steering_vector: torch.Tensor,
+        strength: float = 1.0,
+        start_pos: Optional[int] = None,
+        model_type: str = "llama"
+    ):
+        """
+        Initialize steering hook.
+
+        Args:
+            layer_idx: Layer index to apply steering at
+            steering_vector: Vector to add to activations (d_model,)
+            strength: Multiplier for steering vector
+            start_pos: Token position to start steering from (None = all positions)
+            model_type: Model architecture type (for compatibility)
+        """
+        self.layer_idx = layer_idx
+        self.steering_vector = steering_vector
+        self.strength = strength
+        self.start_pos = start_pos
+        self.model_type = model_type
+        self.hook_handle = None
+
+    def _steering_hook(self, module: Any, input: Tuple[torch.Tensor, ...], output: Any) -> Any:
+        """
+        The actual hook function that modifies layer outputs.
+
+        Args:
+            module: The layer module
+            input: Input to the layer
+            output: Output from the layer (hidden states)
+
+        Returns:
+            Modified output with steering applied
+        """
+        if isinstance(output, tuple):
+            hidden_states = output[0]  # (batch, seq, hidden_dim)
+            batch_size, seq_len, hidden_dim = hidden_states.shape
+
+            # Move steering vector to same device and dtype as hidden states
+            steering_vec = (self.steering_vector * self.strength).to(hidden_states.device).to(hidden_states.dtype)
+
+            # Check dimension compatibility
+            if steering_vec.shape[0] != hidden_dim:
+                raise ValueError(
+                    f"Steering vector dimension ({steering_vec.shape[0]}) does not match "
+                    f"hidden state dimension ({hidden_dim}). "
+                    f"This usually means the steering vector was computed for a different "
+                    f"layer or model configuration."
+                )
+
+            if self.start_pos is not None and self.start_pos < seq_len:
+                # Only apply steering from start_pos onwards
+                modified_hidden_states = hidden_states.clone()
+                modified_hidden_states[:, self.start_pos:, :] += steering_vec.view(1, 1, -1)
+                return (modified_hidden_states,) + output[1:]
+            elif self.start_pos is None:
+                # Apply to all positions
+                modified_hidden_states = hidden_states + steering_vec.view(1, 1, -1)
+                return (modified_hidden_states,) + output[1:]
+            else:
+                # start_pos is beyond current sequence, no steering yet
+                return output
+        else:
+            # Fallback for non-tuple output
+            steering_vec = (self.steering_vector * self.strength).to(output.device).to(output.dtype)
+            if self.start_pos is None:
+                return output + steering_vec.view(1, 1, -1)
+            else:
+                return output
+
+    def register(self, model: Any) -> Any:
+        """
+        Register the hook on the specified layer of the model.
+
+        Args:
+            model: The model to register the hook on
+
+        Returns:
+            The hook handle (for removal)
+        """
+        # Get the layer module
+        # Try multiple common locations for different architectures
+        layer_module = None
+
+        # Try Gemma 3 multimodal structure first
+        if hasattr(model, 'model') and hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'layers'):
+            layer_module = model.model.language_model.layers[self.layer_idx]
+        # Standard structure: model.model.layers (LLaMA, Gemma 2, Qwen, etc.)
+        # ModelWrapper or model with nested structure
+        elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            layer_module = model.model.layers[self.layer_idx]
+        # Direct access: model.layers
+        # Direct access to layers (e.g., when model.model is passed)
+        elif hasattr(model, 'layers'):
+            layer_module = model.layers[self.layer_idx]
+        # GPT-style models: model.transformer.h
+        elif hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+            layer_module = model.transformer.h[self.layer_idx]
+        elif hasattr(model, 'model') and hasattr(model.model, 'model') and hasattr(model.model.model, 'layers'):
+            # Nested ModelWrapper case
+            layer_module = model.model.model.layers[self.layer_idx]
+        else:
+            # Try to provide helpful error message
+            model_structure = []
+            for attr in ['model', 'transformer', 'layers', 'h']:
+                if hasattr(model, attr):
+                    obj = getattr(model, attr)
+                    model_structure.append(f"model.{attr} ({type(obj).__name__})")
+                    if hasattr(obj, 'layers'):
+                        model_structure.append(f"  -> model.{attr}.layers exists")
+                    if hasattr(obj, 'language_model'):
+                        model_structure.append(f"  -> model.{attr}.language_model exists")
+
+            raise ValueError(
+                f"Could not find layer module for model type {self.model_type}.\n"
+                f"Model structure: {model_structure}"
+            )
+
+        # Register the hook
+        self.hook_handle = layer_module.register_forward_hook(self._steering_hook)
+        return self.hook_handle
+
+    def remove(self):
+        """Remove the registered hook."""
+        if self.hook_handle is not None:
+            self.hook_handle.remove()
+            self.hook_handle = None
 
 
 @dataclass

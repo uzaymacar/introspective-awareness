@@ -26,6 +26,7 @@ MODEL_NAME_MAP = {
     "llama_405b": "meta-llama/Llama-3.1-405B-Instruct",
     "llama_70b": "meta-llama/Llama-3.1-70B-Instruct",
     "llama_8b": "meta-llama/Llama-3.1-8B-Instruct",
+    "llama_3_3_70b": "meta-llama/Llama-3.3-70B-Instruct",
 
     # Qwen models
     "qwen3_235b": "Qwen/Qwen3-235B-A22B-Instruct-2507",  # MoE: 235B total, 22B activated
@@ -44,6 +45,7 @@ MODEL_NAME_MAP = {
     "gemma3_27b": "google/gemma-3-27b-it",
 
     # Add more models as needed
+    "mistral_small": "mistralai/Mistral-Small-Instruct-2409",
 }
 
 # Models that come pre-quantized (skip BitsAndBytes quantization)
@@ -80,6 +82,22 @@ class ModelWrapper:
 
         # Get HuggingFace model path
         self.hf_path = MODEL_NAME_MAP.get(model_name, model_name)
+
+        # Infer model type from model name (for architecture-specific code)
+        if "llama" in model_name.lower():
+            self.model_type = "llama"
+        elif "qwen" in model_name.lower():
+            self.model_type = "qwen"
+        elif "gemma" in model_name.lower():
+            self.model_type = "gemma"
+        elif "deepseek" in model_name.lower():
+            self.model_type = "deepseek"
+        elif "mistral" in model_name.lower():
+            self.model_type = "mistral"
+        elif "gpt" in model_name.lower():
+            self.model_type = "gpt"
+        else:
+            self.model_type = "unknown"
 
         print(f"Loading model: {self.hf_path}")
         if model_name in PRE_QUANTIZED_MODELS:
@@ -270,6 +288,24 @@ class ModelWrapper:
 
         raise ValueError(f"Could not determine number of layers for {self.model_name}")
 
+    @property
+    def d_model(self) -> int:
+        """Get hidden dimension (d_model) of the model."""
+        # Try standard config attributes
+        if hasattr(self.model.config, 'hidden_size'):
+            return self.model.config.hidden_size
+        elif hasattr(self.model.config, 'd_model'):
+            return self.model.config.d_model
+        elif hasattr(self.model.config, 'dim'):
+            return self.model.config.dim
+        elif hasattr(self.model.config, 'n_embd'):
+            return self.model.config.n_embd
+        # Check for nested text_config (e.g., Gemma 3, multimodal models)
+        elif hasattr(self.model.config, 'text_config') and hasattr(self.model.config.text_config, 'hidden_size'):
+            return self.model.config.text_config.hidden_size
+
+        raise ValueError(f"Could not determine hidden dimension for {self.model_name}")
+
     def get_layer_module(self, layer_idx: int):
         """
         Get the transformer layer module at the specified index.
@@ -373,6 +409,12 @@ class ModelWrapper:
         """
         # Prepare steering vector
         steering_vec = (steering_vector * strength).to(self.device).to(self.dtype)
+        
+        # Validate steering vector dimension by checking the layer's expected hidden dimension
+        # We can't check exact dimension until we see the actual hidden states, but we can
+        # at least ensure the steering vector is 1D
+        if steering_vec.dim() != 1:
+            raise ValueError(f"Steering vector must be 1D, got shape {steering_vec.shape}")
 
         def steering_hook(module, input, output):
             # output is typically a tuple (hidden_states, ...)
@@ -382,6 +424,16 @@ class ModelWrapper:
 
                 # Move steering vector to the same device as hidden_states (for multi-GPU)
                 steering_vec_device = steering_vec.to(hidden_states.device)
+                
+                # Validate dimension compatibility
+                steering_dim = steering_vec_device.shape[0]
+                if steering_dim != hidden_dim:
+                    raise ValueError(
+                        f"Steering vector dimension ({steering_dim}) does not match "
+                        f"layer hidden dimension ({hidden_dim}) at layer {layer_idx}. "
+                        f"This usually means the steering vector was computed for a different "
+                        f"layer or model configuration."
+                    )
 
                 if steering_start_pos is not None and steering_start_pos < seq_len:
                     # Only apply steering from steering_start_pos onwards
@@ -450,7 +502,118 @@ class ModelWrapper:
         else:
             output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
+        # Fix for Gemma models: chat template includes "model\n" as regular tokens
+        # These don't get removed by skip_special_tokens, so we strip them manually
+        gemma_models = ["gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"]
+        if self.model_name in gemma_models and output_text.startswith("model\n"):
+            output_text = output_text[len("model\n"):]
+
         return output_text.strip()
+
+    def generate_with_activations(
+        self,
+        prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        do_sample: bool = False,
+        steering_vector: Optional[torch.Tensor] = None,
+        steering_layer: Optional[int] = None,
+        steering_strength: float = 1.0,
+        steering_start_pos: Optional[int] = None,
+        return_logits: bool = True,
+        **generation_kwargs,
+    ) -> Tuple[str, Optional[torch.Tensor]]:
+        """
+        Generate text with optional steering and return both text and logits.
+
+        Used for attribution patching where we need gradients through the generation.
+
+        Args:
+            prompt: Input prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            do_sample: Whether to sample or use greedy decoding
+            steering_vector: Optional vector to add to activations
+            steering_layer: Layer to apply steering at (required if steering_vector provided)
+            steering_strength: Multiplier for steering vector
+            steering_start_pos: Token position to start steering from (None = all positions)
+            return_logits: Whether to return logits
+
+        Returns:
+            (generated_text, logits) where logits is the final token logits if return_logits=True
+        """
+        # Tokenize input
+        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        input_length = inputs["input_ids"].shape[1]
+
+        # Setup steering hook if needed
+        hook = None
+        if steering_vector is not None and steering_layer is not None:
+            steering_vec = (steering_vector * steering_strength).to(self.device).to(self.dtype)
+
+            def steering_hook(module, input, output):
+                if isinstance(output, tuple):
+                    hidden_states = output[0]
+                    batch_size, seq_len, hidden_dim = hidden_states.shape
+                    steering_vec_device = steering_vec.to(hidden_states.device)
+
+                    if steering_start_pos is not None and steering_start_pos < seq_len:
+                        # Only apply steering from steering_start_pos onwards
+                        modified_hidden_states = hidden_states.clone()
+                        modified_hidden_states[:, steering_start_pos:, :] += steering_vec_device.view(1, 1, -1)
+                        return (modified_hidden_states,) + output[1:]
+                    elif steering_start_pos is None:
+                        # Apply to all positions
+                        modified_hidden_states = hidden_states + steering_vec_device.view(1, 1, -1)
+                        return (modified_hidden_states,) + output[1:]
+                    else:
+                        # steering_start_pos is beyond current sequence, no steering yet
+                        return output
+                return output
+
+            layer_module = self.get_layer_module(steering_layer)
+            hook = layer_module.register_forward_hook(steering_hook)
+            self.hooks.append(hook)
+
+        # Generate with model.generate() to get output_ids
+        gen_config = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature if do_sample else 1.0,
+            "do_sample": do_sample,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            **generation_kwargs,
+        }
+
+        output_ids = self.model.generate(**inputs, **gen_config)
+
+        # Decode the generated text
+        new_tokens = output_ids[0][input_length:]
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+        else:
+            output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        # Fix for Gemma models: chat template includes "model\n" as regular tokens
+        # These don't get removed by skip_special_tokens, so we strip them manually
+        gemma_models = ["gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"]
+        if self.model_name in gemma_models and output_text.startswith("model\n"):
+            output_text = output_text[len("model\n"):]
+
+        # Get logits if requested (do a forward pass on the full sequence)
+        # Note: Don't use no_grad() here so gradients can flow for attribution patching
+        logits = None
+        if return_logits:
+            outputs = self.model(output_ids, use_cache=False)
+            logits = outputs.logits[:, -1, :]  # Get logits for last token
+
+        # Clean up hook
+        if hook is not None:
+            hook.remove()
+            self.hooks.remove(hook)
+
+        return output_text.strip(), logits
 
     def generate(
         self,
@@ -502,6 +665,12 @@ class ModelWrapper:
             output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
         else:
             output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        # Fix for Gemma models: chat template includes "model\n" as regular tokens
+        # These don't get removed by skip_special_tokens, so we strip them manually
+        gemma_models = ["gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"]
+        if self.model_name in gemma_models and output_text.startswith("model\n"):
+            output_text = output_text[len("model\n"):]
 
         return output_text.strip()
 
@@ -555,6 +724,13 @@ class ModelWrapper:
                 output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
             else:
                 output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+            # Fix for Gemma models: chat template includes "model\n" as regular tokens
+            # These don't get removed by skip_special_tokens, so we strip them manually
+            gemma_models = ["gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"]
+            if self.model_name in gemma_models and output_text.startswith("model\n"):
+                output_text = output_text[len("model\n"):]
+
             outputs.append(output_text.strip())
 
         return outputs
@@ -640,6 +816,9 @@ class ModelWrapper:
         # Adjust steering positions for left padding
         # When using left padding, shorter prompts get padding tokens added to the left,
         # which shifts all token indices. We need to adjust steering positions accordingly.
+        # Ensure steering_pos_tensor is defined, set to None if not.
+        if 'steering_pos_tensor' not in locals():
+            steering_pos_tensor = None
         if steering_pos_tensor is not None and self.tokenizer.padding_side == "left":
             max_length = inputs['input_ids'].shape[1]
             padding_amounts = [max_length - length for length in input_lengths]
@@ -680,6 +859,13 @@ class ModelWrapper:
                 output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
             else:
                 output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+            # Fix for Gemma models: chat template includes "model\n" as regular tokens
+            # These don't get removed by skip_special_tokens, so we strip them manually
+            gemma_models = ["gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"]
+            if self.model_name in gemma_models and output_text.startswith("model\n"):
+                output_text = output_text[len("model\n"):]
+
             outputs.append(output_text.strip())
 
         return outputs
@@ -866,14 +1052,50 @@ class ModelWrapper:
                 print(f"  ✗ WARNING: Expected {1 + max_new_tokens * len(prompts)}, got {len(hook_calls)}")
 
         # Decode only the newly generated tokens for each sample
+        # Important: model.generate() returns sequences WITH input tokens prepended
+        # We need to identify exactly where the input ends and generation begins
         outputs = []
-        for i, input_length in enumerate(input_lengths):
-            new_tokens = output_ids[i][input_length:]
-            # Convert to list for tokenizers that expect list (not tensor)
-            if self.model_name in ["kimi_k2", "deepseek_v3"]:
-                output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+        for i in range(len(prompts)):
+            # Get non-padded input tokens for comparison
+            input_mask = inputs['attention_mask'][i]
+            input_tokens_no_pad = inputs['input_ids'][i][input_mask.bool()]
+
+            # Output sequence includes input + generated tokens
+            output_sequence = output_ids[i]
+
+            # Find where input tokens end in the output by comparing
+            # The output might have padding removed or might preserve it
+            # Strategy: Find the last position where input tokens match output tokens
+            input_len = len(input_tokens_no_pad)
+            output_len = len(output_sequence)
+
+            # Check if the output starts with the input tokens (no padding)
+            # or if we need to account for padding
+            if output_len >= input_len and torch.equal(output_sequence[:input_len], input_tokens_no_pad):
+                # Output starts with non-padded input, slice from there
+                generated_ids = output_sequence[input_len:]
             else:
-                output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+                # Fall back to slicing from the full input sequence length (including padding)
+                # This handles cases where padding is preserved or tokenization changed
+                input_seq_len = inputs['input_ids'].shape[1]
+                if output_len > input_seq_len:
+                    generated_ids = output_sequence[input_seq_len:]
+                else:
+                    # Last resort: use attention mask sum
+                    generated_ids = output_sequence[input_mask.sum().item():]
+
+            # Decode the generated tokens
+            if self.model_name in ["kimi_k2", "deepseek_v3"]:
+                output_text = self.tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+            else:
+                output_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+            # Fix for Gemma models: chat template includes "model\n" as regular tokens
+            # These don't get removed by skip_special_tokens, so we strip them manually
+            gemma_models = ["gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"]
+            if self.model_name in gemma_models and output_text.startswith("model\n"):
+                output_text = output_text[len("model\n"):]
+
             outputs.append(output_text.strip())
 
         return outputs

@@ -1,12 +1,8 @@
 """
-Experiment 1: Injected Thoughts Detection (Baseline)
-
-This is the simplest experiment, replicating the core result from the paper:
+Replicating the core result from https://transformer-circuits.pub/2025/introspection/index.html:
 - Extract concept vectors for simple words
 - Inject concepts via activation steering
 - Test if model can detect the injected thoughts
-
-This establishes the baseline detection capability.
 
 Usage:
     # Single model
@@ -71,7 +67,7 @@ DEFAULT_N_TRIALS = 30
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_BATCH_SIZE = 256
-DEFAULT_OUTPUT_DIR = "introspective-awareness"
+DEFAULT_OUTPUT_DIR = "data"
 DEFAULT_DEVICE = "cuda"
 DEFAULT_DTYPE = "bfloat16"
 DEFAULT_MODEL = "llama_8b"
@@ -131,7 +127,7 @@ def run_experiment(
     layer_fraction: float = 0.7,
     strength: float = 8.0,
     n_trials: int = 5,
-    output_dir: Path = Path("introspective-awareness"),
+    output_dir: Path = Path("data"),
     device: str = "cuda",
     dtype: str = "bfloat16",
     quantization: str = None,
@@ -556,6 +552,14 @@ def run_experiment(
     return evaluated_results, metrics
 
 
+def sanitize_model_name_for_display(model_name: str) -> str:
+    """
+    Convert model name to display-friendly format.
+    Replaces underscores and slashes with dashes to avoid matplotlib subscript issues.
+    """
+    return model_name.replace('_', '-').replace('/', '-')
+
+
 def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: List[float], strengths: List[float], output_dir: Path):
     """Create plots showing detection accuracy across layers and strengths."""
     plt.rcParams.update({'font.size': 14})
@@ -566,25 +570,58 @@ def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: 
     individual_plots_dir = plots_dir / "individual"
     individual_plots_dir.mkdir(exist_ok=True)
 
-    # Organize results by concept
+    # Organize results by concept (EXCLUDE forced_injection trials from detection calculations)
+    # Store injection and control results separately to compute meaningful accuracy
     results_by_concept = {concept: {} for concept in concepts}
     for (layer_frac, strength), data in all_results.items():
         for result in data["results"]:
+            # Skip forced_injection trials - they don't measure spontaneous detection
+            if result.get("trial_type") == "forced_injection":
+                continue
+
             concept = result["concept"]
             if (layer_frac, strength) not in results_by_concept[concept]:
-                results_by_concept[concept][(layer_frac, strength)] = []
-            results_by_concept[concept][(layer_frac, strength)].append(result["detected"])
+                results_by_concept[concept][(layer_frac, strength)] = {
+                    'injection': [],
+                    'control': []
+                }
 
-    # Compute detection rates and standard errors
+            # Determine trial type with backward compatibility
+            trial_type = result.get("trial_type")
+            if trial_type is None:
+                # Old results without trial_type: infer from injected field
+                trial_type = "injection" if result.get("injected") else "control"
+
+            # Get LLM judge detection result (not the naive string matching "detected" field)
+            llm_detected = result.get("evaluations", {}).get("claims_detection", {}).get("claims_detection", False)
+
+            if trial_type == "injection":
+                # For injection trials: detected=True is correct (TP)
+                results_by_concept[concept][(layer_frac, strength)]['injection'].append(llm_detected)
+            elif trial_type == "control":
+                # For control trials: detected=False is correct (TN)
+                results_by_concept[concept][(layer_frac, strength)]['control'].append(llm_detected)
+
+    # Compute detection ACCURACY (not just raw detection rate) and standard errors
     detection_rates = {concept: {} for concept in concepts}
     detection_errors = {concept: {} for concept in concepts}
     for concept in concepts:
-        for (layer_frac, strength), detections in results_by_concept[concept].items():
-            n = len(detections)
-            rate = sum(1 for d in detections if d == True) / n if n > 0 else 0.0
+        for (layer_frac, strength), trial_data in results_by_concept[concept].items():
+            injection_trials = trial_data['injection']
+            control_trials = trial_data['control']
+
+            # Count correct detections
+            true_positives = sum(1 for d in injection_trials if d == True)
+            true_negatives = sum(1 for d in control_trials if d == False)
+            total = len(injection_trials) + len(control_trials)
+
+            # Detection accuracy = (TP + TN) / Total
+            accuracy = (true_positives + true_negatives) / total if total > 0 else 0.0
+
             # Standard error: SE = sqrt(p * (1-p) / n)
-            se = np.sqrt(rate * (1 - rate) / n) if n > 0 else 0.0
-            detection_rates[concept][(layer_frac, strength)] = rate
+            se = np.sqrt(accuracy * (1 - accuracy) / total) if total > 0 else 0.0
+
+            detection_rates[concept][(layer_frac, strength)] = accuracy
             detection_errors[concept][(layer_frac, strength)] = se
 
     # 1. Heatmaps for each concept (layer x strength)
@@ -602,7 +639,7 @@ def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: 
         ax.set_yticklabels([f"{lf:.2f}" for lf in layer_fractions], fontsize=16)
         ax.set_xlabel('Steering Strength', fontsize=18, fontweight='bold')
         ax.set_ylabel('Layer Fraction', fontsize=18, fontweight='bold')
-        ax.set_title(f'Detection Accuracy: {concept}', fontsize=20, fontweight='bold')
+        ax.set_title(f'Detection Accuracy: {concept}\n(Injection + Control Trials)', fontsize=20, fontweight='bold')
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.spines['bottom'].set_visible(False)
@@ -614,7 +651,7 @@ def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: 
                 text = ax.text(j, i, f'{heatmap_data[i, j]:.2f}', ha="center", va="center", color="black", fontsize=12)
 
         cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('Detection Rate', fontsize=16, fontweight='bold')
+        cbar.set_label('Detection Accuracy', fontsize=16, fontweight='bold')
         cbar.ax.tick_params(labelsize=14)
         plt.tight_layout()
         plt.savefig(individual_plots_dir / f'{concept}_heatmap.png', dpi=150, bbox_inches='tight')
@@ -629,8 +666,8 @@ def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: 
             ax.errorbar(strengths, rates, yerr=errors, marker='o', markersize=8, linewidth=2,
                        capsize=5, capthick=2, label=f'Layer {layer_frac:.2f}')
         ax.set_xlabel('Steering Strength', fontsize=18, fontweight='bold')
-        ax.set_ylabel('Detection Rate', fontsize=18, fontweight='bold')
-        ax.set_title(f'{concept}: Detection Rate vs Strength', fontsize=20, fontweight='bold')
+        ax.set_ylabel('Detection Accuracy', fontsize=18, fontweight='bold')
+        ax.set_title(f'{concept}: Detection Accuracy vs Strength', fontsize=20, fontweight='bold')
         ax.legend(fontsize=14, loc='best')
         ax.set_ylim(-0.05, 1.05)
         ax.tick_params(labelsize=14)
@@ -649,8 +686,8 @@ def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: 
             ax.errorbar(layer_fractions, rates, yerr=errors, marker='o', markersize=8, linewidth=2,
                        capsize=5, capthick=2, label=f'Strength {strength:.1f}')
         ax.set_xlabel('Layer Fraction', fontsize=18, fontweight='bold')
-        ax.set_ylabel('Detection Rate', fontsize=18, fontweight='bold')
-        ax.set_title(f'{concept}: Detection Rate vs Layer', fontsize=20, fontweight='bold')
+        ax.set_ylabel('Detection Accuracy', fontsize=18, fontweight='bold')
+        ax.set_title(f'{concept}: Detection Accuracy vs Layer', fontsize=20, fontweight='bold')
         ax.legend(fontsize=14, loc='best')
         ax.set_ylim(-0.05, 1.05)
         ax.tick_params(labelsize=14)
@@ -685,8 +722,8 @@ def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: 
                      linewidth=1.5, capsize=5, error_kw={'linewidth': 2, 'ecolor': 'black'})
         ax.set_xticks(x_pos)
         ax.set_xticklabels(plot_concepts, rotation=45, ha='right', fontsize=16)
-        ax.set_ylabel('Best Detection Rate', fontsize=18, fontweight='bold')
-        ax.set_title('Best Detection Rate by Concept', fontsize=20, fontweight='bold')
+        ax.set_ylabel('Best Detection Accuracy', fontsize=18, fontweight='bold')
+        ax.set_title('Best Detection Accuracy by Concept\n(Injection + Control)', fontsize=20, fontweight='bold')
         ax.set_ylim(0, 1.1)
         ax.tick_params(labelsize=14)
         ax.spines['top'].set_visible(False)
@@ -759,12 +796,178 @@ def create_sweep_plots(all_results: Dict, concepts: List[str], layer_fractions: 
     print(f"  - Summary plots: {plots_dir}")
     print(f"  - Individual concept plots: {individual_plots_dir}")
     if best_configs:
-        print("\nBest configurations:")
+        print("\nBest configurations (by detection accuracy):")
         for concept, (config, rate, error) in best_configs.items():
             layer_frac, strength = config
-            print(f"  {concept}: Layer={layer_frac:.2f}, Strength={strength:.1f}, Rate={rate:.2%} (SE={error:.2%})")
+            print(f"  {concept}: Layer={layer_frac:.2f}, Strength={strength:.1f}, Accuracy={rate:.2%} (SE={error:.2%})")
     else:
         print("\nNo results found for any concepts.")
+
+
+def create_trial_type_comparison_plots(all_results: Dict, output_dir: Path):
+    """
+    Create plots comparing detection/identification across trial types:
+    - Injection trials: spontaneous detection
+    - Control trials: spontaneous (should not detect)
+    - Forced injection trials: forced to notice, only measure identification
+
+    Args:
+        all_results: Dictionary mapping (layer_frac, strength) -> results dict with metrics
+        output_dir: Directory to save plots
+    """
+    plt.rcParams.update({'font.size': 14})
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+
+    # Create subdirectory for trial type plots
+    trial_type_plots_dir = plots_dir / "by_trial_type"
+    trial_type_plots_dir.mkdir(exist_ok=True)
+
+    # Extract best configuration (highest combined rate)
+    best_config = None
+    best_combined_rate = 0.0
+    for (layer_frac, strength), data in all_results.items():
+        if data.get('combined_detection_and_identification_rate', 0) > best_combined_rate:
+            best_combined_rate = data['combined_detection_and_identification_rate']
+            best_config = (layer_frac, strength)
+
+    if best_config is None:
+        print("No results found for trial type comparison plots")
+        return
+
+    layer_frac, strength = best_config
+    best_data = all_results[best_config]
+
+    # Plot 1: Detection rates by trial type (Injection vs Control only)
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    trial_types = ['Injection\n(Should Detect)', 'Control\n(Should Not Detect)']
+    detection_rates = [
+        best_data.get('detection_hit_rate', 0),
+        best_data.get('detection_false_alarm_rate', 0)
+    ]
+    colors = ['#2ca02c', '#d62728']  # Green for hits, red for false alarms
+
+    bars = ax.bar(trial_types, detection_rates, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+    ax.set_ylabel('Detection Rate', fontsize=18, fontweight='bold')
+    ax.set_title(f'Detection Rates by Trial Type\n(L={layer_frac:.2f}, S={strength:.1f})',
+                 fontsize=20, fontweight='bold')
+    ax.set_ylim(0, 1.1)
+    ax.tick_params(labelsize=14)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # Add value labels
+    for bar, val in zip(bars, detection_rates):
+        ax.text(bar.get_x() + bar.get_width()/2, val + 0.02, f'{val:.2%}',
+               ha='center', va='bottom', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(trial_type_plots_dir / 'detection_by_trial_type.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Plot 2: Identification accuracy comparison (all trial types)
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    # Three bars:
+    # 1. Injection (spontaneous): identification given claim
+    # 2. Injection (spontaneous): combined detection AND identification
+    # 3. Forced injection: identification accuracy
+
+    categories = [
+        'Injection Trials\n(ID | Claim Detection)',
+        'Injection Trials\n(Detect ∧ ID)',
+        'Forced Injection\n(ID only)'
+    ]
+
+    id_given_claim = best_data.get('identification_accuracy_given_claim', 0)
+    combined_rate = best_data.get('combined_detection_and_identification_rate', 0)
+    forced_id = best_data.get('forced_identification_accuracy', 0)
+
+    values = [
+        id_given_claim,
+        combined_rate,
+        forced_id
+    ]
+
+    colors = ['#1f77b4', '#ff7f0e', '#9467bd']  # Blue, orange, purple
+
+    bars = ax.bar(categories, values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+    ax.set_ylabel('Accuracy / Rate', fontsize=18, fontweight='bold')
+    ax.set_title(f'Identification Performance by Trial Type\n(L={layer_frac:.2f}, S={strength:.1f})',
+                 fontsize=20, fontweight='bold')
+    ax.set_ylim(0, 1.1)
+    ax.tick_params(labelsize=13)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # Add value labels
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width()/2, val + 0.02, f'{val:.2%}',
+               ha='center', va='bottom', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(trial_type_plots_dir / 'identification_by_trial_type.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Plot 3: Comprehensive metrics summary
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    metric_names = [
+        'Detection\nHit Rate\n(Injection)',
+        'Detection\nFalse Alarm\n(Control)',
+        'Detection\nAccuracy',
+        'ID Given\nClaim\n(Injection)',
+        'Combined\nDetect ∧ ID\n(Injection)',
+        'Forced ID\nAccuracy'
+    ]
+
+    metric_values = [
+        best_data.get('detection_hit_rate', 0),
+        best_data.get('detection_false_alarm_rate', 0),
+        best_data.get('detection_accuracy', 0),
+        id_given_claim,
+        combined_rate,
+        forced_id
+    ]
+
+    # Color code by category: green for detection, blue for identification
+    colors = ['#2ca02c', '#d62728', '#9467bd', '#1f77b4', '#ff7f0e', '#8c564b']
+
+    x_pos = np.arange(len(metric_names))
+    bars = ax.bar(x_pos, metric_values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(metric_names, fontsize=12, ha='center')
+    ax.set_ylabel('Rate / Accuracy', fontsize=16, fontweight='bold')
+    ax.set_title(f'Comprehensive Metrics Across All Trial Types\n(L={layer_frac:.2f}, S={strength:.1f})',
+                 fontsize=18, fontweight='bold')
+    ax.set_ylim(0, 1.1)
+    ax.tick_params(labelsize=12)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # Add value labels
+    for bar, val in zip(bars, metric_values):
+        ax.text(bar.get_x() + bar.get_width()/2, val + 0.02, f'{val:.1%}',
+               ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    # Add legend
+    legend_elements = [
+        plt.Rectangle((0,0),1,1, fc='#2ca02c', alpha=0.8, label='Detection (Positive)'),
+        plt.Rectangle((0,0),1,1, fc='#d62728', alpha=0.8, label='Detection (Negative)'),
+        plt.Rectangle((0,0),1,1, fc='#9467bd', alpha=0.8, label='Detection (Overall)'),
+        plt.Rectangle((0,0),1,1, fc='#1f77b4', alpha=0.8, label='ID (Conditional)'),
+        plt.Rectangle((0,0),1,1, fc='#ff7f0e', alpha=0.8, label='ID (Combined)'),
+        plt.Rectangle((0,0),1,1, fc='#8c564b', alpha=0.8, label='ID (Forced)'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(trial_type_plots_dir / 'comprehensive_metrics.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"\nTrial type comparison plots saved to: {trial_type_plots_dir}")
 
 
 def create_cross_model_comparison_plots(base_output_dir: Path, models: List[str]):
@@ -903,7 +1106,9 @@ def create_cross_model_comparison_plots(base_output_dir: Path, models: List[str]
         ax.set_title('Key introspection metrics across models (best configuration per model)',
                     fontsize=16)
         ax.set_xticks(x)
-        ax.set_xticklabels(model_names, rotation=45, ha='right', fontsize=18)
+        # Sanitize model names for display
+        display_names = [sanitize_model_name_for_display(name) for name in model_names]
+        ax.set_xticklabels(display_names, rotation=45, ha='right', fontsize=18)
         ax.set_ylim(0, 1.2)  # Extra padding at top for legend
         ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])  # Only show valid rates
         ax.tick_params(labelsize=12)
@@ -952,7 +1157,8 @@ def create_cross_model_comparison_plots(base_output_dir: Path, models: List[str]
                 ax.set_yticklabels([f"{l:.2f}" for l in layers], fontsize=14)
                 ax.set_xlabel('Strength', fontsize=16)
                 ax.set_ylabel('Layer fraction', fontsize=16)
-                ax.set_title(f'{model_name}', fontsize=18)
+                # Sanitize model name for display
+                ax.set_title(f'{sanitize_model_name_for_display(model_name)}', fontsize=18)
                 ax.spines['top'].set_visible(False)
                 ax.spines['right'].set_visible(False)
                 ax.spines['bottom'].set_visible(False)
@@ -1026,7 +1232,7 @@ def create_cross_model_comparison_plots(base_output_dir: Path, models: List[str]
                     ax1.errorbar(data['layer_fracs'], data['true_positive_rate'],
                                yerr=data['true_positive_rate_se'],
                                marker='o', markersize=8, linewidth=2.5, capsize=5, capthick=2,
-                               label=model_name, color=color, alpha=0.8)
+                               label=sanitize_model_name_for_display(model_name), color=color, alpha=0.8)
 
             ax1.set_xlabel('Layer fraction', fontsize=16)
             ax1.set_ylabel('True positive rate', fontsize=16)
@@ -1044,7 +1250,7 @@ def create_cross_model_comparison_plots(base_output_dir: Path, models: List[str]
                     ax2.errorbar(data['layer_fracs'], data['introspection'],
                                yerr=data['introspection_se'],
                                marker='o', markersize=8, linewidth=2.5, capsize=5, capthick=2,
-                               label=model_name, color=color, alpha=0.8)
+                               label=sanitize_model_name_for_display(model_name), color=color, alpha=0.8)
                     # Track max introspection value (including error bars)
                     if data['introspection']:
                         max_with_error = max(i + se for i, se in zip(data['introspection'], data['introspection_se']))
@@ -1483,7 +1689,7 @@ def main():
                             else:
                                 metrics = saved_data.get("metrics", {})
 
-                            # Store in all_results for later plotting (handle None values)
+                            # Store in all_results for later plotting
                             all_results[(layer_frac, strength)] = {
                                 "results": results,
                                 "detection_hit_rate": metrics.get("detection_hit_rate") or 0,
@@ -1717,7 +1923,7 @@ def main():
                                         "combined_detection_and_identification_rate": updated_metrics.get("combined_detection_and_identification_rate") or 0,
                                         "forced_identification_accuracy": updated_metrics.get("forced_identification_accuracy") or 0,
                                     }
-    
+
                                     config_pbar.set_postfix({
                                         "Hit": f"{updated_metrics.get('detection_hit_rate') or 0:.2%}",
                                         "FA": f"{updated_metrics.get('detection_false_alarm_rate') or 0:.2%}",
@@ -1745,7 +1951,7 @@ def main():
                                         results = saved_data.get("results", [])
                                         metrics = saved_data.get("metrics", {})
     
-                                        # Store in all_results for later plotting (handle None values)
+                                        # Store in all_results for later plotting
                                         all_results[(layer_frac, strength)] = {
                                             "results": results,
                                             "detection_hit_rate": metrics.get("detection_hit_rate") or 0,
@@ -1755,8 +1961,8 @@ def main():
                                             "combined_detection_and_identification_rate": metrics.get("combined_detection_and_identification_rate") or 0,
                                             "forced_identification_accuracy": metrics.get("forced_identification_accuracy") or 0,
                                         }
-    
-                                        # Update progress bar with loaded metrics (handle None values)
+
+                                        # Update progress bar with loaded metrics
                                         config_pbar.set_postfix({
                                             "Hit": f"{metrics.get('detection_hit_rate') or 0:.2%}",
                                             "FA": f"{metrics.get('detection_false_alarm_rate') or 0:.2%}",
@@ -2240,6 +2446,7 @@ def main():
                     f.write(f"  Detection Hit Rate: {data['detection_hit_rate']:.2%}\n")
                     f.write(f"  Detection False Alarm Rate: {data['detection_false_alarm_rate']:.2%}\n")
                     f.write(f"  Detection Accuracy: {data['detection_accuracy']:.2%}\n")
+
                     f.write(f"  Identification Accuracy (given claim): {data['identification_accuracy_given_claim']:.2%}\n")
                     f.write(f"  Combined Detection + ID Rate: {data['combined_detection_and_identification_rate']:.2%}\n")
                     f.write(f"  Forced Identification Accuracy: {data['forced_identification_accuracy']:.2%}\n")
@@ -2248,6 +2455,7 @@ def main():
             # Create plots (always regenerate, even when results were loaded from disk)
             print("\nCreating plots...")
             create_sweep_plots(all_results, args.concepts, layer_fractions, strengths, output_base)
+            create_trial_type_comparison_plots(all_results, output_base)
 
             print(f"\nSweep complete for {current_model}! Results saved to: {output_base}")
             print(f"  Configurations loaded from disk: {loaded_configs}/{total_configs}")
